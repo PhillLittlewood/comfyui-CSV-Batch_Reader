@@ -38,8 +38,8 @@ function findNode(id) {
     return nodes.find((n) => String(n.id) === String(id) && (n.comfyClass ?? n.type) === NODE_TYPE);
 }
 
-function setImageNumber(node, value) {
-    const widget = node?.widgets?.find((w) => w.name === "image_number");
+function setItemNumber(node, value) {
+    const widget = node?.widgets?.find((w) => w.name === "item_number");
     if (!widget) return;
     widget.value = value;
     widget.callback?.(value);
@@ -178,21 +178,22 @@ function h(tag, props = {}, ...children) {
     return el;
 }
 
+const FIELD_STYLE = {
+    background: "var(--comfy-input-bg, #222)", color: "var(--input-text, #ddd)",
+    border: "1px solid var(--border-color, #4e4e4e)", borderRadius: "4px",
+    padding: "5px 7px", fontSize: "13px", width: "100%", boxSizing: "border-box",
+};
+const BUTTON_STYLE = {
+    background: "var(--comfy-input-bg, #353535)", color: "var(--input-text, #ddd)",
+    border: "1px solid var(--border-color, #4e4e4e)", borderRadius: "4px",
+    padding: "6px 14px", fontSize: "13px", cursor: "pointer",
+};
+
 function openSettings(node) {
     if (document.getElementById("csv-batch-reader-settings")) return;
     const original = readColumns(node);
     let draft = original.map((c) => ({ ...c }));
 
-    const fieldStyle = {
-        background: "var(--comfy-input-bg, #222)", color: "var(--input-text, #ddd)",
-        border: "1px solid var(--border-color, #4e4e4e)", borderRadius: "4px",
-        padding: "5px 7px", fontSize: "13px", width: "100%", boxSizing: "border-box",
-    };
-    const buttonStyle = {
-        background: "var(--comfy-input-bg, #353535)", color: "var(--input-text, #ddd)",
-        border: "1px solid var(--border-color, #4e4e4e)", borderRadius: "4px",
-        padding: "6px 14px", fontSize: "13px", cursor: "pointer",
-    };
     const gridStyle = { display: "grid", gridTemplateColumns: "1.5fr 1fr 1fr 32px", gap: "6px", alignItems: "center" };
 
     const overlay = h("div", {
@@ -234,7 +235,7 @@ function openSettings(node) {
         const input = h("input", {
             type: col.type === "text" ? "text" : "number",
             value: String(col.default ?? ""),
-            style: fieldStyle,
+            style: FIELD_STYLE,
             oninput: (e) => { col.default = e.target.value; },
         });
         if (col.type === "int") input.step = "1";
@@ -254,11 +255,11 @@ function openSettings(node) {
         );
         draft.forEach((col, i) => {
             const nameInput = h("input", {
-                type: "text", value: col.name, placeholder: "column name", style: fieldStyle,
+                type: "text", value: col.name, placeholder: "column name", style: FIELD_STYLE,
                 oninput: (e) => { col.name = e.target.value; },
             });
             const typeSelect = h("select", {
-                style: fieldStyle,
+                style: FIELD_STYLE,
                 onchange: (e) => {
                     col.type = e.target.value;
                     col.default = cleanDefault(col.type, col.default);
@@ -272,7 +273,7 @@ function openSettings(node) {
             }
             const remove = h("button", {
                 textContent: "\u2715", title: "Remove this column", disabled: draft.length <= 1,
-                style: { ...buttonStyle, padding: "4px 0", width: "32px" },
+                style: { ...BUTTON_STYLE, padding: "4px 0", width: "32px" },
                 onclick: () => { draft.splice(i, 1); render(); },
             });
             body.append(h("div", { style: { ...gridStyle, marginBottom: "6px" } },
@@ -304,11 +305,11 @@ function openSettings(node) {
     }
 
     const addButton = h("button", {
-        textContent: "+ Add column", style: buttonStyle,
+        textContent: "+ Add column", style: BUTTON_STYLE,
         onclick: () => { draft.push({ id: newId(), name: "", type: "text", default: "" }); errorBox.textContent = ""; render(); },
     });
     const resetButton = h("button", {
-        textContent: "Reset to defaults", style: buttonStyle,
+        textContent: "Reset to defaults", style: BUTTON_STYLE,
         title: "Back to positive, negative, width, height, duration",
         onclick: () => { draft = sanitize(DEFAULT_COLUMNS); errorBox.textContent = ""; render(); },
     });
@@ -323,13 +324,218 @@ function openSettings(node) {
         h("div", { style: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" } },
             addButton, resetButton, counter,
             h("span", { style: { flex: "1" } }),
-            h("button", { textContent: "Cancel", style: buttonStyle, onclick: close }),
-            h("button", { textContent: "Save", style: { ...buttonStyle, background: "#2b6cb0", color: "#fff" }, onclick: save }),
+            h("button", { textContent: "Cancel", style: BUTTON_STYLE, onclick: close }),
+            h("button", { textContent: "Save", style: { ...BUTTON_STYLE, background: "#2b6cb0", color: "#fff" }, onclick: save }),
         ),
     );
     render();
     document.addEventListener("keydown", onKey, true);
     document.body.append(overlay);
+}
+
+// ------------------------------------------------------------- preview window
+
+const TYPE_BADGES = { text: "TEXT", int: "INT", float: "FLOAT", boolean: "BOOL" };
+const COLOR = { accent: "#4da3ff", warn: "#e0a93b", bad: "#ff6b6b", good: "#5cc27a", muted: "var(--descrip-text, #999)" };
+
+function formatDefault(column) {
+    if (column.type === "boolean") return column.default ? "yes" : "no";
+    if (column.type === "text") return column.default === "" ? "empty" : String(column.default);
+    return String(column.default);
+}
+
+function plural(n, word) {
+    return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+async function openPreview(node) {
+    if (document.getElementById("csv-batch-reader-preview")) return;
+    const file = node.widgets?.find((w) => w.name === "csv_filename")?.value;
+    let current = Number(node.widgets?.find((w) => w.name === "item_number")?.value) || 1;
+
+    const overlay = h("div", {
+        id: "csv-batch-reader-preview",
+        style: {
+            position: "fixed", inset: "0", background: "rgba(0,0,0,0.55)", zIndex: "10000",
+            display: "flex", alignItems: "center", justifyContent: "center",
+        },
+    });
+    const panel = h("div", {
+        style: {
+            background: "var(--comfy-menu-bg, #202020)", color: "var(--input-text, #ddd)",
+            border: "1px solid var(--border-color, #4e4e4e)", borderRadius: "8px", padding: "18px",
+            width: "min(1180px, 96vw)", height: "min(760px, 90vh)", display: "flex", flexDirection: "column",
+            fontFamily: "sans-serif", fontSize: "13px", boxShadow: "0 8px 30px rgba(0,0,0,0.5)",
+        },
+    });
+    overlay.append(panel);
+
+    function close() {
+        document.removeEventListener("keydown", onKey, true);
+        overlay.remove();
+    }
+    function onKey(e) {
+        if (e.key === "Escape") { e.stopPropagation(); close(); }
+    }
+
+    const info = h("div", { style: { opacity: "0.85", margin: "6px 0 0" } });
+    const notice = h("div", { style: { margin: "8px 0 0", lineHeight: "1.5" } });
+    const startLabel = h("span", { style: { color: COLOR.accent } });
+    const wrapBox = h("input", { type: "checkbox", id: "csv-batch-reader-wrap" });
+    const toolbar = h("div", {
+        style: { display: "none", alignItems: "center", gap: "14px", margin: "10px 0 8px", flexWrap: "wrap" },
+    },
+        h("label", { style: { display: "flex", alignItems: "center", gap: "5px", cursor: "pointer" } },
+            wrapBox, "Wrap long text"),
+        h("span", { style: { opacity: "0.7" } }, "Click a row to make it the starting row."),
+        h("span", { style: { flex: "1" } }),
+        startLabel,
+    );
+    const body = h("div", {
+        style: {
+            flex: "1", overflow: "auto", minHeight: "0",
+            border: "1px solid var(--border-color, #4e4e4e)", borderRadius: "4px",
+        },
+    }, "Loading...");
+
+    panel.append(
+        h("div", { style: { display: "flex", alignItems: "baseline", gap: "10px" } },
+            h("div", { style: { fontSize: "16px", fontWeight: "bold" } }, "CSV preview"),
+            h("div", { style: { opacity: "0.7", flex: "1", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, String(file ?? "")),
+            h("button", { textContent: "Close", style: BUTTON_STYLE, onclick: close }),
+        ),
+        info, notice, toolbar, body,
+    );
+    document.addEventListener("keydown", onKey, true);
+    document.body.append(overlay);
+
+    if (!file || String(file).startsWith("Put_CSV")) {
+        body.textContent = "No CSV chosen yet. Click \"Browse for CSV...\" on the node first, then open the preview.";
+        body.style.padding = "16px";
+        return;
+    }
+
+    let data;
+    try {
+        const response = await api.fetchApi("/csv_batch_reader/preview", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ file, config: configWidget(node)?.value ?? "", limit: 500 }),
+        });
+        data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data?.error || `${response.status} ${response.statusText}`);
+    } catch (err) {
+        body.textContent = String(err?.message ?? err);
+        body.style.padding = "16px";
+        body.style.color = COLOR.bad;
+        return;
+    }
+    if (!document.body.contains(overlay)) return; // closed while loading
+
+    // header position -> the Settings column that reads it
+    const readBy = new Map();
+    for (const column of data.columns) {
+        if (column.header_index >= 0 && !readBy.has(column.header_index)) readBy.set(column.header_index, column);
+    }
+    const missing = data.columns.filter((c) => c.header_index < 0);
+    let emptyCells = 0;
+    let badCells = 0;
+    for (const marks of data.status) {
+        for (const mark of marks) {
+            if (mark === "empty") emptyCells++;
+            else if (mark === "bad") badCells++;
+        }
+    }
+
+    info.textContent = `${plural(data.total_rows, "row")}` +
+        (data.truncated ? ` (showing the first ${data.rows.length})` : "") +
+        ` \u00b7 ${plural(data.headers.length, "column")}`;
+
+    const lines = [];
+    const inRows = data.truncated ? " in the rows shown" : "";
+    if (missing.length) {
+        lines.push([COLOR.warn, "Not found in this CSV, so their defaults are used: " +
+            missing.map((c) => `${c.name} (${formatDefault(c)})`).join(", ") + "."]);
+    }
+    if (emptyCells) lines.push([COLOR.warn, `${plural(emptyCells, "empty cell")}${inRows} will use the column's default.`]);
+    if (badCells) lines.push([COLOR.bad, `${plural(badCells, "cell")}${inRows} can't be read as the column's type and will use the default.`]);
+    if (!lines.length) lines.push([COLOR.good, "All the columns in Settings were found and every cell can be read."]);
+    for (const [color, text] of lines) notice.append(h("div", { style: { color } }, text));
+
+    const cellStyle = { padding: "4px 8px", borderBottom: "1px solid var(--border-color, #3a3a3a)", verticalAlign: "top", textAlign: "left" };
+    const clipStyle = { maxWidth: "320px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" };
+    const wrapStyle = { maxWidth: "320px", whiteSpace: "normal", overflow: "visible", textOverflow: "clip", wordBreak: "break-word" };
+    const textCells = [];
+
+    const headerRow = h("tr", {}, h("th", {
+        style: { ...cellStyle, position: "sticky", top: "0", background: "var(--comfy-menu-bg, #202020)", zIndex: "1", opacity: "0.7" },
+    }, "#"));
+    data.headers.forEach((name, i) => {
+        const column = readBy.get(i);
+        headerRow.append(h("th", {
+            style: { ...cellStyle, position: "sticky", top: "0", background: "var(--comfy-menu-bg, #202020)", zIndex: "1", opacity: column ? "1" : "0.55" },
+        },
+            h("div", {}, name || "(no name)"),
+            h("div", { style: { fontWeight: "normal", fontSize: "11px", color: column ? COLOR.accent : COLOR.muted } },
+                column ? `\u2192 ${column.name} \u00b7 ${TYPE_BADGES[column.type] ?? column.type}` : "ignored"),
+        ));
+    });
+
+    const rowEls = [];
+    function paintRow(tr, n) {
+        tr.style.background = n === current ? "rgba(77,163,255,0.22)" : "";
+    }
+    function select(n) {
+        current = n;
+        setItemNumber(node, n);
+        rowEls.forEach((el, i) => paintRow(el, i + 1));
+        startLabel.textContent = `Starting row: ${n}`;
+    }
+
+    const tbody = h("tbody");
+    data.rows.forEach((cells, r) => {
+        const n = r + 1;
+        const tr = h("tr", {
+            style: { cursor: "pointer" },
+            onclick: () => select(n),
+            onmouseenter: () => { if (n !== current) tr.style.background = "rgba(255,255,255,0.06)"; },
+            onmouseleave: () => paintRow(tr, n),
+        }, h("td", { style: { ...cellStyle, opacity: "0.7", textAlign: "right" } }, String(n)));
+        cells.forEach((raw, i) => {
+            const column = readBy.get(i);
+            const status = data.status[r][i];
+            const td = h("td", { style: { ...cellStyle, opacity: column ? "1" : "0.55" } });
+            const inner = h("div", { title: raw });
+            if (column && status === "empty") {
+                inner.append(h("span", { style: { color: COLOR.warn, fontStyle: "italic" } }, `(default: ${formatDefault(column)})`));
+                inner.title = `Empty. The default (${formatDefault(column)}) is used.`;
+            } else if (column && status === "bad") {
+                inner.append(h("span", { style: { color: COLOR.bad } }, `${raw} \u2192 default ${formatDefault(column)}`));
+                inner.title = `Can't be read as ${TYPE_BADGES[column.type] ?? column.type}. The default (${formatDefault(column)}) is used.`;
+            } else {
+                inner.textContent = raw;
+            }
+            textCells.push(inner);
+            td.append(inner);
+            tr.append(td);
+        });
+        rowEls.push(tr);
+        paintRow(tr, n);
+        tbody.append(tr);
+    });
+
+    function applyWrap() {
+        const style = wrapBox.checked ? wrapStyle : clipStyle;
+        for (const el of textCells) Object.assign(el.style, style);
+    }
+    wrapBox.onchange = applyWrap;
+    applyWrap();
+
+    startLabel.textContent = `Starting row: ${current}`;
+    toolbar.style.display = "flex";
+    body.replaceChildren(h("table", { style: { borderCollapse: "collapse", width: "100%", fontSize: "12px" } },
+        h("thead", {}, headerRow), tbody));
+    rowEls[current - 1]?.scrollIntoView?.({ block: "center" });
 }
 
 // -------------------------------------------------------------- Browse button
@@ -389,19 +595,19 @@ app.registerExtension({
     },
 
     setup() {
-        // The node reports which row it is processing; show it in image_number.
+        // The node reports which row it is processing; show it in item_number.
         api.addEventListener("csv_batch_reader.row", ({ detail }) => {
             if (!detail) return;
             const id = String(detail.node);
             const node = findNode(id);
             if (!detail.run_all) {
                 batches.delete(id);
-                setImageNumber(node, detail.row);
+                setItemNumber(node, detail.row);
                 return;
             }
             if (!batches.has(id)) batches.set(id, { start: detail.row, finishing: false });
             if (detail.last) batches.get(id).finishing = true;
-            setImageNumber(node, detail.row);
+            setItemNumber(node, detail.row);
         });
 
         // When the whole batch has finished, go back to the row it started from
@@ -409,7 +615,7 @@ app.registerExtension({
         const finish = () => {
             for (const [id, batch] of [...batches]) {
                 if (!batch.finishing) continue;
-                setImageNumber(findNode(id), batch.start);
+                setItemNumber(findNode(id), batch.start);
                 batches.delete(id);
             }
         };
@@ -428,8 +634,9 @@ app.registerExtension({
         node.__csvBatchReady = true;
 
         hideWidget(configWidget(node));
-        node.addWidget("button", "Settings...", null, () => openSettings(node));
         node.addWidget("button", "Browse for CSV...", null, () => browseForCsv(node));
+        node.addWidget("button", "Preview CSV...", null, () => openPreview(node));
+        node.addWidget("button", "Settings...", null, () => openSettings(node));
         applyColumns(node, true);
 
         // When a saved workflow loads, its saved settings arrive after the node is

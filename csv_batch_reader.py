@@ -61,19 +61,32 @@ def _list_csvs():
 
 def _inside(base, path):
     base, path = os.path.realpath(base), os.path.realpath(path)
-    return os.path.commonpath((base, path)) == base
+    try:
+        return os.path.commonpath((base, path)) == base
+    except ValueError:  # e.g. different drives on Windows
+        return False
+
+
+def _find_csv(csv_filename):
+    """Full path of a CSV chosen in the node, or None. Only .csv files inside this
+    node's csv_files folder or the Browse upload folder can ever be used."""
+    name = str(csv_filename or "")
+    if not name.lower().endswith(".csv"):
+        return None
+    candidates = [(_node_csv_dir(), name)]
+    if name.startswith(UPLOAD_SUBFOLDER + "/") and _upload_dir():
+        candidates.append((_upload_dir(), name[len(UPLOAD_SUBFOLDER) + 1:]))
+    for base, relative in candidates:
+        path = os.path.join(base, relative)
+        if _inside(base, path) and os.path.isfile(path):
+            return path
+    return None
 
 
 def _csv_path(csv_filename):
-    """Full path of the picked CSV (this node's csv_files folder, or one added with Browse)."""
-    candidates = [(_node_csv_dir(), csv_filename)]
-    if csv_filename.startswith(UPLOAD_SUBFOLDER + "/") and _upload_dir():
-        candidates.append((_upload_dir(), csv_filename[len(UPLOAD_SUBFOLDER) + 1:]))
-    for base, name in candidates:
-        path = os.path.join(base, name)
-        if _inside(base, path) and os.path.isfile(path):
-            return path
-    return os.path.join(_node_csv_dir(), csv_filename)  # not found; read will report it
+    """Path to read for the picked CSV (a missing file is reported when it is opened)."""
+    return _find_csv(csv_filename) or os.path.join(
+        _node_csv_dir(), os.path.basename(str(csv_filename or "")))
 
 
 # ---------------------------------------------------------------- columns
@@ -118,25 +131,128 @@ def _load_columns(config_text):
              "default": _coerce_default(c["type"], c["default"])} for c in DEFAULT_COLUMNS]
 
 
-def _read_cell(kind, raw, default, label):
-    """Turns a CSV cell into the column's type. Empty or unreadable cells give the default."""
+def _parse_cell(kind, raw):
+    """Reads one CSV cell as the column's type. Returns (value, status) where status is
+    'ok', 'empty' (nothing in the cell) or 'bad' (can't be understood); value is only
+    meaningful when the status is 'ok'."""
     text = raw.strip() if isinstance(raw, str) else ""
-    if kind == "text":
-        return text if text else default
     if not text:
-        return default
+        return None, "empty"
+    if kind == "text":
+        return text, "ok"
     if kind == "boolean":
         if text.lower() in _TRUE:
-            return True
+            return True, "ok"
         if text.lower() in _FALSE:
-            return False
-    else:
-        match = _NUMBER.search(text.replace(",", ""))
-        if match:
-            value = float(match.group())
-            return int(round(value)) if kind == "int" else value
-    print(f"[CSV Batch Reader] Can't use '{text}' for {label}, using the default ({default}).")
+            return False, "ok"
+        return None, "bad"
+    match = _NUMBER.search(text.replace(",", ""))
+    if not match:
+        return None, "bad"
+    value = float(match.group())
+    return (int(round(value)) if kind == "int" else value), "ok"
+
+
+def _read_cell(kind, raw, default, label):
+    """A cell's value, or the column's default when it is empty or unreadable."""
+    value, status = _parse_cell(kind, raw)
+    if status == "ok":
+        return value
+    if status == "bad":
+        print(f"[CSV Batch Reader] Can't use '{str(raw).strip()}' for {label}, using the default ({default}).")
     return default
+
+
+def _column_index(headers_lower, name):
+    """Position of a column in the CSV header (the last match wins, as when reading
+    rows), or -1. Same matching the node uses: ignores case and spaces."""
+    wanted = name.strip().lower()
+    for candidate in [wanted] + (["negetive"] if wanted == "negative" else []):  # old spelling
+        if candidate in headers_lower:
+            return headers_lower[candidate]
+    return -1
+
+
+PREVIEW_LIMIT = 500
+
+
+def _build_preview(csv_filename, config_text, limit=PREVIEW_LIMIT):
+    """Everything the Preview window needs: the CSV's header and first rows, which
+    header each Settings column matches, and for every cell read by a Settings
+    column whether it is fine, empty or unreadable (judged exactly as a run would)."""
+    path = _find_csv(csv_filename)
+    if path is None:
+        raise FileNotFoundError(
+            f"Can't find {csv_filename or 'a CSV file'}. Pick a CSV in the node, or use "
+            "Browse for CSV...")
+    headers, rows, total = None, [], 0
+    try:
+        with open(path, 'r', encoding='utf-8-sig') as f:
+            for record in csv.reader(f):
+                if not record:  # blank lines are skipped, as when running
+                    continue
+                if headers is None:
+                    headers = [(h or "").strip() for h in record]
+                    continue
+                total += 1
+                if len(rows) < limit:
+                    rows.append((record + [""] * len(headers))[:len(headers)])
+    except (OSError, UnicodeDecodeError, csv.Error) as e:
+        raise ValueError(f"Could not read {csv_filename}: {e}")
+    if headers is None:
+        raise ValueError(f"{csv_filename} is empty. The first line must be the column names.")
+
+    headers_lower = {h.lower(): i for i, h in enumerate(headers)}
+    columns = []
+    for column in _load_columns(config_text):
+        columns.append({**column, "header_index": _column_index(headers_lower, column["name"])})
+
+    status = []
+    for cells in rows:
+        marks = [""] * len(headers)
+        for column in columns:
+            if column["header_index"] >= 0:
+                marks[column["header_index"]] = _parse_cell(
+                    column["type"], cells[column["header_index"]])[1]
+        status.append(marks)
+
+    return {"file": csv_filename, "headers": headers, "rows": rows, "status": status,
+            "columns": columns, "total_rows": total, "truncated": total > len(rows)}
+
+
+def _register_routes():
+    """Adds the web address the Preview window asks for its data. If this can't be
+    done the node still works; only the Preview window is unavailable."""
+    try:
+        from aiohttp import web
+        from server import PromptServer
+        routes = PromptServer.instance.routes
+    except Exception:
+        return  # not running inside ComfyUI
+
+    async def csv_batch_reader_preview(request):
+        try:
+            data = await request.json()
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        try:
+            limit = max(1, min(int(data.get("limit", PREVIEW_LIMIT)), 2000))
+        except (TypeError, ValueError):
+            limit = PREVIEW_LIMIT
+        try:
+            return web.json_response(
+                _build_preview(str(data.get("file", "")), str(data.get("config", "")), limit))
+        except FileNotFoundError as e:
+            return web.json_response({"error": str(e)}, status=404)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+    try:
+        routes.post("/csv_batch_reader/preview")(csv_batch_reader_preview)
+    except Exception as e:
+        print(f"[CSV Batch Reader] Preview is unavailable ({e}). The node itself works normally.")
 
 
 def _queue_next_row_when_finished(prompt_id, prompt, unique_id, extra_pnginfo,
@@ -189,7 +305,7 @@ def _queue_next_row_when_finished(prompt_id, prompt, unique_id, extra_pnginfo,
     try:
         urllib.request.urlopen(request, timeout=30, context=context).read()
     except Exception as e:
-        print(f"[CSV Batch Reader] Could not queue image {next_number}: {e}")
+        print(f"[CSV Batch Reader] Could not queue item {next_number}: {e}")
 
 
 class CSVBatchReader:
@@ -300,7 +416,7 @@ class CSVBatchReader:
         except Exception:
             pass
 
-        print(f"[CSV Batch Reader] Image {item_number} of {len(rows)}"
+        print(f"[CSV Batch Reader] Item {item_number} of {len(rows)}"
               f"{' - next one will be queued when this finishes' if has_more else ''}")
 
         if has_more and prompt is not None and unique_id is not None:
@@ -316,7 +432,7 @@ class CSVBatchReader:
                     daemon=True,
                 ).start()
             except Exception as e:
-                print(f"[CSV Batch Reader] Could not set up the next image: {e}")
+                print(f"[CSV Batch Reader] Could not set up the next item: {e}")
 
         # one value per chosen column, padded to the node's fixed number of sockets
         return tuple(values) + (None,) * (MAX_COLUMNS - len(values))
@@ -330,3 +446,6 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CSVBatchReader": "CSV Batch Reader"
 }
+
+
+_register_routes()
